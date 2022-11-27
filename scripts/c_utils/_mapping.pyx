@@ -15,6 +15,11 @@ from libc.math cimport round as _round
 
 from sensor_msgs.msg import LaserScan
 
+import rospy
+import tf
+from tf.transformations import euler_from_quaternion
+
+
 
 cdef struct _Point2D:
     float x
@@ -80,6 +85,7 @@ cdef _Point2D tf_point_to_local(_Point2D _p, _Pose2D _to) nogil:
 cdef class _MAP:
 
     cdef:
+        bint _block, _new_tf
         readonly float pading
         readonly float obs_size
         readonly float _resulation
@@ -101,15 +107,23 @@ cdef class _MAP:
 
     def map_to_origin(self):
         return _Point2D(self.origin.point.x,self.origin.point.y)
+
+    cpdef np.ndarray get_unknown_map(self, tuple shape, int val=-1,dtype=np.int8):
+        cdef:
+            np.ndarray _a=np.empty(shape,dtype=dtype)
+
+        _a.fill(val)
+        return _a
         
     cdef void _add_origin_offset(self, _Point2D _p) nogil:
         self.origin.point.x+= _p.x
         self.origin.point.y+= _p.y
 
     def __cinit__(self,resulation=0.01):
+        self._block = self._new_tf = False
         self.origin = _Pose2D(_Point2D(0.,0.), 0.)
         print(self.origin)
-        self.grid = np.zeros((1,1),dtype=np.int8)
+        self.grid = self.get_unknown_map((1,1))
         # self.location = _Pose2D(_Point2D(0.,0.),0.)
         self.laser_tf = _Pose2D(_Point2D(0.45,0.),0.)
         self.resulation = resulation
@@ -117,9 +131,40 @@ cdef class _MAP:
         self.pading = 1.0
         assert self.resulation
 
-    cpdef void on_odom(self,data):
-        self.location.point.x = data.pose.pose.position.x
-        self.location.point.y = data.pose.pose.position.y
+        self.tfl = tf.TransformListener()
+
+    cpdef void update_tf(self,t=None):
+        # cdef:
+        #     float[3] trans
+        #     float[4] rot
+
+        t = t or rospy.Time(0)
+
+        try:
+            (trans,rot) = self.tfl.lookupTransform('/odom', '/base_footprint', t)
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+            return
+
+        print("base_footprint:",trans)
+        self.location.point.x = trans[0]
+        self.location.point.y = trans[1]
+        self.location.th = euler_from_quaternion(rot)[2]
+
+        try:
+            (trans,rot) = self.tfl.lookupTransform('/base_footprint', '/hokuyo_link', t)
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+            return
+
+        print("hokuyo_link:",trans)
+        self.laser_tf.point.x = trans[0]
+        self.laser_tf.point.y = trans[1]
+        self.laser_tf.th = euler_from_quaternion(rot)[2]
+
+
+        self._new_tf = True
+
+
+        
 
     
     
@@ -129,6 +174,18 @@ cdef class _MAP:
         Args:
             data (LaserScan): data from topic in sensor_msgs/LaserScan format.
         """
+
+        self.update_tf(data.header.stamp)
+        if self._block:
+            print("blocked!!!")
+            return
+            
+        if not self._new_tf:
+            print("no new_tf!!!")
+            return
+
+        self._block = True
+        self._new_tf = False
         
         # ranges = cython.declare(c_float[:])
         
@@ -154,8 +211,12 @@ cdef class _MAP:
             if (min_dist <= dist <= max_dist):
                 ang = min_ang+(i*ang_inc)
                 self._set_obs(dist, ang)
+                
                     
         printf("done...\n")
+
+        self._block = False
+        
 
 
     cdef void _set_obs(self, float dist, float ang) nogil : 
@@ -192,7 +253,7 @@ cdef class _MAP:
 
             if _idx.h - extra < 0 :
                 insert_size = abs(_idx.h-extra)
-                self.grid = np.insert(self.grid, 0, np.zeros((abs(insert_size), 1), dtype="int8"), axis=0)
+                self.grid = np.insert(self.grid, 0, self.get_unknown_map((abs(insert_size), 1), dtype="int8"), axis=0)
 
                 _insert_idx.w = 0
                 _insert_idx.h = insert_size
@@ -202,14 +263,14 @@ cdef class _MAP:
 
             if _idx.h + extra >= _shp[0]:
                 insert_size = _idx.h + extra - (_shp[0] - 1)
-                self.grid = np.insert(self.grid, _shp[0], np.zeros((insert_size, 1), dtype="int8"), axis=0)
+                self.grid = np.insert(self.grid, _shp[0], self.get_unknown_map((insert_size, 1), dtype="int8"), axis=0)
 
                 _shp[0] += insert_size
 
             if _idx.w - extra < 0:
                 insert_size = abs(_idx.w - extra)
 
-                self.grid = np.insert(self.grid, 0, np.zeros((insert_size, 1), dtype="int8"), axis=1)
+                self.grid = np.insert(self.grid, 0, self.get_unknown_map((insert_size, 1), dtype="int8"), axis=1)
 
                 _insert_idx.h = 0
                 _insert_idx.w = insert_size
@@ -220,7 +281,7 @@ cdef class _MAP:
             if _idx.w + extra >= _shp[1]:
                 insert_size = _idx.w + extra - (_shp[1] - 1)
                 
-                self.grid = np.insert(self.grid, _shp[1], np.zeros((insert_size, 1), dtype="int8"), axis=1)
+                self.grid = np.insert(self.grid, _shp[1], self.get_unknown_map((insert_size, 1), dtype="int8"), axis=1)
 
                 _shp[1] += insert_size
 
